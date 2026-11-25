@@ -5,11 +5,13 @@ from typing import Annotated, Literal
 
 from pydantic import Field, StrictInt, field_validator, model_validator
 
-from fieldproof.design.contracts import Input, Key, WholeSecond
+from fieldproof.design.contracts import Input, Key, ShortText, WholeSecond
 
 SignalKind = Literal["start", "complete", "abort", "manual", "alarm", "meter"]
 MeterValue = Annotated[StrictInt, Field(ge=0, le=1_000_000_000)]
 Revision = Annotated[StrictInt, Field(ge=1, le=1_000_000)]
+HandoverStatus = Literal["pending", "approved", "withdrawn"]
+HandoverAction = Literal["register", "correct", "approve", "withdraw"]
 
 
 class Event(Input):
@@ -57,4 +59,64 @@ class Delivery(Input):
         keys = {(event.event_id, event.revision) for event in self.events}
         if len(keys) != len(self.events):
             raise ValueError("A delivery cannot contain an event revision twice")
+        return self
+
+
+class HandoverSubmission(Input):
+    """现场登记或更正一次换表交接。
+
+    register/correct 必须给出交接时刻、两个计量段（旧表与新表）及断点读数；
+    停表区间若可核查，需同时给出上下界，只给一边不予接受。
+    approve/withdraw 只引用交接编号；撤销核准后材料保留但退出当前依据。
+    """
+
+    handover_id: Key
+    submission_id: Key
+    action: HandoverAction
+    unit_id: Key | None = None
+    occurred_at: WholeSecond | None = None
+    old_meter_id: Key | None = None
+    old_reading_wh: MeterValue | None = None
+    new_meter_id: Key | None = None
+    new_reading_wh: MeterValue | None = None
+    gap_low_wh: MeterValue | None = None
+    gap_high_wh: MeterValue | None = None
+    stoppage_gap: bool = False
+    note: ShortText | None = None
+
+    @field_validator("occurred_at")
+    @classmethod
+    def normalize_time(cls, value):
+        return value.astimezone(UTC) if value is not None else None
+
+    @model_validator(mode="after")
+    def shape_for_action(self):
+        full = (
+            "unit_id",
+            "occurred_at",
+            "old_meter_id",
+            "old_reading_wh",
+            "new_meter_id",
+            "new_reading_wh",
+        )
+        if self.action in {"register", "correct"}:
+            absent = [name for name in full if getattr(self, name) is None]
+            if absent:
+                raise ValueError(f"{self.action} requires fields: {', '.join(absent)}")
+            if self.old_meter_id == self.new_meter_id:
+                raise ValueError("The two metering segments must use different meter IDs")
+        else:
+            extras = [
+                name
+                for name in (*full, "gap_low_wh", "gap_high_wh", "stoppage_gap")
+                if getattr(self, name) not in (None, False)
+            ]
+            if extras:
+                raise ValueError(f"{self.action} only references the handover identifier")
+        bounds = self.gap_low_wh, self.gap_high_wh
+        if any(value is not None for value in bounds):
+            if any(value is None for value in bounds):
+                raise ValueError("A stoppage bound needs both a low and a high value")
+            if self.gap_low_wh > self.gap_high_wh:
+                raise ValueError("The stoppage lower bound cannot exceed the upper bound")
         return self

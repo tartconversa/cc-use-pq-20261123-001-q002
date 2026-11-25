@@ -10,9 +10,10 @@ from fieldproof.common import encoded, fingerprint, invalid, missing
 from fieldproof.design.registry import Trial, require_phase, roster
 from fieldproof.release.gates import assess
 from fieldproof.signals.cycles import Cycle, resolve_cycles
+from fieldproof.signals.handovers import Handover, as_of
 from fieldproof.signals.ledger import current_cut, events_at, require_cut
 
-EVIDENCE_FORMAT = 1
+EVIDENCE_FORMAT = 2
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class Material:
     cut: int
     cycles: list[Cycle]
     units: dict[str, UnitSummary]
+    handovers: list[Handover]
 
 
 def select_window(trial: Trial, start: date | None, end: date | None) -> AnalysisWindow:
@@ -42,12 +44,18 @@ def load(
     selected = current_cut(db, trial.trial_id) if cut is None else cut
     require_cut(db, trial.trial_id, selected)
     assigned = roster(db, trial.trial_id)
+    handovers = as_of(db, trial.trial_id, selected)
     cycles = resolve_cycles(
         events_at(db, trial.trial_id, selected),
         assigned,
         trial.plan.policy,
+        handovers,
     )
-    return Material(window, selected, cycles, summarize(trial, assigned, cycles, window))
+    return Material(
+        window, selected, cycles,
+        summarize(trial, assigned, cycles, window),
+        handovers,
+    )
 
 
 def analyze(trial: Trial, material: Material) -> dict:
@@ -62,6 +70,11 @@ def analyze(trial: Trial, material: Material) -> dict:
         and (cycle.day is None or material.window.contains(cycle.day))
     ]
     units = [row.payload(policy) for row in material.units.values()]
+    handovers = [
+        handover.payload()
+        for handover in material.handovers
+        if handover.unit_id in material.units
+    ]
     return {
         "format": EVIDENCE_FORMAT,
         "trial_id": trial.trial_id,
@@ -75,6 +88,8 @@ def analyze(trial: Trial, material: Material) -> dict:
         ]),
         "facts_digest": fingerprint(relevant),
         "unit_digest": fingerprint(units),
+        "handover_digest": fingerprint(handovers),
+        "handovers": handovers,
         "market_results": markets,
     }
 
@@ -143,4 +158,9 @@ def unit_record(material: Material, trial: Trial, unit_id: str) -> dict:
         "window": material.window.payload(),
         "unit": item.payload(trial.plan.policy),
         "cycles": cycles,
+        "handovers": [
+            handover.payload()
+            for handover in material.handovers
+            if handover.unit_id == unit_id
+        ],
     }

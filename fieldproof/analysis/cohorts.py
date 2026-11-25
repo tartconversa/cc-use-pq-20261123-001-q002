@@ -8,9 +8,20 @@ from typing import Iterable
 
 from fieldproof.design.contracts import Enrollment, Policy, enrolled_days
 from fieldproof.design.registry import Roster, Trial
-from fieldproof.signals.cycles import Cycle
+from fieldproof.signals.cycles import (
+    ENERGY_BOUNDED,
+    ENERGY_METERED,
+    ENERGY_SPLICED,
+    PENDING_SPLICE,
+    UNBOUNDED_GAP,
+    Cycle,
+)
 
 ARMS = ("standard", "assisted")
+CONFIRMED_STATUSES = (ENERGY_METERED, ENERGY_SPLICED)
+# 耗电结论的三种口径：确认（含完整计量与核准拼接）、有界、待补证/缺口。
+RANGE_STATUSES = (ENERGY_BOUNDED,)
+OPEN_STATUSES = (PENDING_SPLICE, UNBOUNDED_GAP)
 
 
 @dataclass
@@ -32,6 +43,10 @@ class UnitSummary:
     failed: int = 0
     energy_cycles: int = 0
     total_wh: int = 0
+    bounded_cycles: int = 0
+    bounded_low_wh: int = 0
+    bounded_high_wh: int = 0
+    open_energy_cycles: int = 0
     elapsed_seconds: int = 0
 
     def record(self, cycle: Cycle):
@@ -46,11 +61,18 @@ class UnitSummary:
         self.alarms += int(cycle.alarm)
         self.failed += int(cycle.failed)
         self.elapsed_seconds += cycle.elapsed_seconds
-        if cycle.energy.wh is not None:
+        energy = cycle.energy
+        if energy.confirmed:
             self.energy_cycles += 1
-            self.total_wh += cycle.energy.wh
-        elif not cycle.failed:
-            self.energy_issues[cycle.energy.problem] += 1
+            self.total_wh += energy.wh
+        elif energy.bounded:
+            self.bounded_cycles += 1
+            self.bounded_low_wh += energy.low_wh
+            self.bounded_high_wh += energy.high_wh
+        elif not cycle.failed and energy.problem:
+            if energy.status in OPEN_STATUSES:
+                self.open_energy_cycles += 1
+            self.energy_issues[energy.problem] += 1
 
     def eligible(self, policy: Policy) -> bool:
         return self.usable_cycles >= policy.required_cycles_per_unit
@@ -70,7 +92,19 @@ class UnitSummary:
         }[name]
         return self.rate(numerator, self.usable_cycles)
 
+    def energy_interval(self) -> tuple[Fraction, Fraction] | None:
+        """单设备每周期平均耗电的区间：确认值作定点，有界周期并入上下界。"""
+        measured = self.energy_cycles
+        bounded = self.bounded_cycles
+        if not measured and not bounded:
+            return None
+        denominator = measured + bounded
+        low = Fraction(self.total_wh + self.bounded_low_wh, denominator)
+        high = Fraction(self.total_wh + self.bounded_high_wh, denominator)
+        return low, high
+
     def payload(self, policy: Policy) -> dict:
+        interval = self.energy_interval()
         return {
             "unit_id": self.unit_id,
             "site_id": self.site_id,
@@ -90,6 +124,12 @@ class UnitSummary:
             "failed_cycles": self.failed,
             "energy_cycles": self.energy_cycles,
             "total_wh": self.total_wh,
+            "bounded_energy_cycles": self.bounded_cycles,
+            "bounded_low_wh": self.bounded_low_wh,
+            "bounded_high_wh": self.bounded_high_wh,
+            "open_energy_cycles": self.open_energy_cycles,
+            "energy_interval_low_wh": str(interval[0]) if interval else None,
+            "energy_interval_high_wh": str(interval[1]) if interval else None,
             "elapsed_seconds": self.elapsed_seconds,
         }
 
@@ -140,25 +180,64 @@ class ArmSummary:
 
     @property
     def energy_coverage(self) -> Fraction | None:
+        """原定覆盖口径：完整计量（含核准拼接）周期占合格设备完整周期的比例。"""
         complete = sum(unit.completed for unit in self.eligible)
         measured = sum(unit.energy_cycles for unit in self.eligible)
         return Fraction(measured, complete) if complete else None
 
     @property
+    def bounded_coverage(self) -> Fraction | None:
+        """完整计量加有界计量对合格设备完整周期的覆盖率。"""
+        complete = sum(unit.completed for unit in self.eligible)
+        covered = sum(
+            unit.energy_cycles + unit.bounded_cycles for unit in self.eligible
+        )
+        return Fraction(covered, complete) if complete else None
+
+    @property
     def measured_units(self) -> int:
-        return sum(unit.energy_cycles > 0 for unit in self.eligible)
+        """有耗电证据（确认或有界）的合格设备数，用于原定覆盖设备数要求。"""
+        return sum(
+            unit.energy_cycles > 0 or unit.bounded_cycles > 0
+            for unit in self.eligible
+        )
+
+    @property
+    def bounded_units(self) -> list[str]:
+        return [unit.unit_id for unit in self.eligible if unit.bounded_cycles]
+
+    @property
+    def open_units(self) -> list[str]:
+        return [unit.unit_id for unit in self.eligible if unit.open_energy_cycles]
 
     def mean(self, name: str) -> Fraction | None:
         values = [value for unit in self.eligible if (value := unit.metric(name)) is not None]
         return sum(values, Fraction(0)) / len(values) if values else None
+
+    def interval_mean(self) -> tuple[Fraction, Fraction] | None:
+        """设备等权的每周期平均耗电区间；无任何计量依据的设备使区间不可用。"""
+        intervals = [
+            value
+            for unit in self.eligible
+            if (value := unit.energy_interval()) is not None
+        ]
+        if not intervals:
+            return None
+        low = sum((item[0] for item in intervals), Fraction(0)) / len(intervals)
+        high = sum((item[1] for item in intervals), Fraction(0)) / len(intervals)
+        return low, high
 
     def payload(self) -> dict:
         return {
             "recruited_units": len(self.recruited),
             "eligible_units": len(self.eligible),
             "energy_units": self.measured_units,
+            "bounded_energy_units": len(self.bounded_units),
+            "open_energy_units": len(self.open_units),
             "eligible_completed_cycles": sum(unit.completed for unit in self.eligible),
             "eligible_measured_cycles": sum(unit.energy_cycles for unit in self.eligible),
+            "eligible_bounded_cycles": sum(unit.bounded_cycles for unit in self.eligible),
+            "eligible_open_cycles": sum(unit.open_energy_cycles for unit in self.eligible),
             "eligible_observed_cycles": sum(unit.usable_cycles for unit in self.eligible),
             "unresolved_units": sum(bool(unit.integrity_issues)
                                      for unit in self.recruited),

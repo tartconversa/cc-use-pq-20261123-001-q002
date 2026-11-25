@@ -50,10 +50,20 @@ class CellEstimate:
     def payload(self) -> dict:
         accounts = {}
         for arm, summary in self.arms.items():
+            interval = summary.interval_mean()
             accounts[arm] = {
                 **summary.payload(),
                 "unit_coverage_bp": display(summary.enrollment_coverage, 10_000),
                 "energy_coverage_bp": display(summary.energy_coverage, 10_000),
+                "bounded_energy_coverage_bp": display(summary.bounded_coverage, 10_000),
+                "energy_interval_wh": (
+                    {
+                        "low": display(interval[0]),
+                        "high": display(interval[1]),
+                    }
+                    if interval is not None
+                    else None
+                ),
             }
         return {
             "cell": self.key,
@@ -131,6 +141,35 @@ class MarketEstimate:
         assisted = self.assisted[name]
         return assisted - standard if assisted is not None and standard is not None else None
 
+    def interval_energy(self, arm: str) -> dict | None:
+        """按预登记固定权重汇总的每周期平均耗电区间（瓦时）。"""
+        low = Fraction(0)
+        high = Fraction(0)
+        supported = []
+        bounded_units = []
+        open_units = []
+        for cell in self.cells:
+            summary = cell.arms[arm]
+            interval = summary.interval_mean()
+            if interval is None:
+                return None
+            weight = Fraction(cell.weight_bp, 10_000)
+            low += interval[0] * weight
+            high += interval[1] * weight
+            bounded_units.extend(summary.bounded_units)
+            open_units.extend(summary.open_units)
+            if summary.bounded_units or summary.measured_units:
+                supported.append(cell.key)
+        return {
+            "low_wh": display(low),
+            "high_wh": display(high),
+            "supporting_cells": sorted(set(supported)),
+            "bounded_units": sorted(bounded_units),
+            "open_energy_units": sorted(open_units),
+            "_low": low,
+            "_high": high,
+        }
+
     def integrity(self) -> dict:
         units = [
             unit
@@ -145,13 +184,63 @@ class MarketEstimate:
             "by_site": integrity_by_site(units),
         }
 
+    def energy_ranges(self) -> dict:
+        standard = self.interval_energy("standard")
+        assisted = self.interval_energy("assisted")
+        payload = {
+            "interpretation": (
+                "Confirmed readings are fixed points; bounded stoppage intervals span "
+                "the low-to-high range; open gaps cannot be bounded"
+            ),
+            "arms": {},
+        }
+        for arm, interval in (("standard", standard), ("assisted", assisted)):
+            if interval is None:
+                payload["arms"][arm] = None
+                continue
+            payload["arms"][arm] = {
+                key: value
+                for key, value in interval.items()
+                if not key.startswith("_")
+            }
+        if standard is not None and assisted is not None:
+            # 最坏情况相对增幅：辅助组上界相对标准组下界。
+            worst = (
+                (assisted["_high"] - standard["_low"]) / standard["_low"]
+                if standard["_low"] > 0
+                else None
+            )
+            best = (
+                (assisted["_low"] - standard["_high"]) / standard["_high"]
+                if standard["_high"] > 0
+                else None
+            )
+            payload["worst_case_relative_increase_bp"] = (
+                display(worst, 10_000) if worst is not None else None
+            )
+            payload["best_case_relative_change_bp"] = (
+                display(best, 10_000) if best is not None else None
+            )
+            payload["zero_baseline_crossing"] = (
+                standard["_low"] == 0 or standard["_high"] == 0
+            )
+            payload["_standard_low"] = standard["_low"]
+            payload["_standard_high"] = standard["_high"]
+            payload["_assisted_low"] = assisted["_low"]
+            payload["_assisted_high"] = assisted["_high"]
+        return payload
+
     def payload(self) -> dict:
+        ranges = self.energy_ranges()
         return {
             "market_id": self.market.market_id,
             "label": self.market.label,
             "cells": [cell.payload() for cell in self.cells],
             "metrics": {
                 name: pair(name, self.standard[name], self.assisted[name]) for name in METRICS
+            },
+            "energy_ranges": {
+                key: value for key, value in ranges.items() if not key.startswith("_")
             },
             "integrity": self.integrity(),
         }

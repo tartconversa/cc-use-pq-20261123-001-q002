@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS review (
     PRIMARY KEY (trial_id, evidence_id, market, desk),
     FOREIGN KEY (trial_id, evidence_id) REFERENCES evidence(trial_id, evidence_id)
 );
+CREATE TABLE IF NOT EXISTS handover_revision (
+    trial_id TEXT NOT NULL,
+    handover_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    unit_id TEXT NOT NULL,
+    delivery_seq INTEGER NOT NULL REFERENCES delivery(seq),
+    document TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (trial_id, handover_id, revision),
+    FOREIGN KEY (trial_id, unit_id) REFERENCES enrollment(trial_id, unit_id)
+);
+CREATE INDEX IF NOT EXISTS handover_cut ON handover_revision(trial_id, delivery_seq);
+CREATE INDEX IF NOT EXISTS handover_unit ON handover_revision(trial_id, unit_id);
 CREATE TABLE IF NOT EXISTS bulletin (
     trial_id TEXT NOT NULL,
     market TEXT NOT NULL,
@@ -83,7 +96,7 @@ CREATE TABLE IF NOT EXISTS bulletin (
     UNIQUE (trial_id, market, evidence_id),
     FOREIGN KEY (trial_id, evidence_id) REFERENCES evidence(trial_id, evidence_id)
 );
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 """
 
 
@@ -94,7 +107,7 @@ class Store:
         session = self.connect()
         try:
             version = session.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError(f"Unsupported database version {version}")
             session.execute("PRAGMA journal_mode=WAL")
             session.executescript(SCHEMA)

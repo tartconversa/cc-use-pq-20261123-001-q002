@@ -9,13 +9,31 @@ from fieldproof.analysis.cohorts import ARMS
 from fieldproof.analysis.evidence import Material
 from fieldproof.common import missing
 from fieldproof.design.registry import Trial, roster
-from fieldproof.signals.cycles import Cycle
+from fieldproof.signals.cycles import (
+    AMBIGUOUS_HANDOVER,
+    BROKEN_METER_CHAIN,
+    ENERGY_BOUNDED,
+    HANDOVER_MISMATCH,
+    PENDING_SPLICE,
+    UNBOUNDED_GAP,
+    Cycle,
+)
 
 PRIORITIES = {
     "unresolved_alarm": 0,
     "integrity": 1,
-    "pending": 2,
-    "energy": 3,
+    "handover": 2,
+    "pending": 3,
+    "energy": 4,
+}
+
+# 需要现场补交接材料才能定论的耗电问题，以及各自缺的材料动作。
+HANDOVER_PROBLEMS = {
+    PENDING_SPLICE: "approve_handover",
+    UNBOUNDED_GAP: "provide_stoppage_bounds_or_approve_chain",
+    AMBIGUOUS_HANDOVER: "distinguish_candidate_handovers",
+    BROKEN_METER_CHAIN: "register_connecting_handover",
+    HANDOVER_MISMATCH: "correct_breakpoint_reading",
 }
 
 
@@ -27,11 +45,15 @@ def queue_entry(cycle: Cycle, site: str, cell: str, arm: str) -> dict | None:
             category = "pending" if cycle.state == "pending" else "integrity"
         issues = cycle.issues
     elif not cycle.failed and cycle.energy.problem:
-        category = "energy"
-        issues = [cycle.energy.problem]
+        if cycle.energy.status in HANDOVER_PROBLEMS:
+            category = "handover"
+            issues = [cycle.energy.problem]
+        else:
+            category = "energy"
+            issues = [cycle.energy.problem]
     else:
         return None
-    return {
+    entry = {
         "category": category,
         "unit_id": cycle.unit_id,
         "cycle_id": cycle.cycle_id,
@@ -42,6 +64,11 @@ def queue_entry(cycle: Cycle, site: str, cell: str, arm: str) -> dict | None:
         "issues": issues,
         "source_revisions": cycle.sources,
     }
+    if category == "handover":
+        entry["handover_ids"] = list(cycle.energy.handover_ids)
+        entry["needed_action"] = HANDOVER_PROBLEMS[cycle.energy.status]
+        entry["energy_gaps"] = cycle.energy.gap_payload()
+    return entry
 
 
 def inspection_queue(
@@ -116,6 +143,66 @@ class CoverageProgress:
 def local_dates(start: date, stop: date):
     for offset in range((stop - start).days):
         yield start + timedelta(days=offset)
+
+
+def handover_worklist(trial: Trial, material: Material, market_id: str) -> dict:
+    """核查队列的交接材料视图：未决结论需要补什么，以及尚未核准的登记。"""
+    market = trial.plan.market(market_id)
+    if market is None:
+        raise missing("market", market_id)
+    units = {
+        unit_id: item
+        for unit_id, item in material.units.items()
+        if item.market == market_id
+    }
+    demands: dict[str, dict] = {}
+    for cycle in material.cycles:
+        item = units.get(cycle.unit_id)
+        if item is None or (cycle.day is not None and not material.window.contains(cycle.day)):
+            continue
+        entry = queue_entry(cycle, item.site_id, item.cell, item.arm)
+        if entry is None or entry["category"] != "handover":
+            continue
+        for handover_id in entry["handover_ids"] or [""]:
+            demand = demands.setdefault(handover_id, {
+                "handover_id": handover_id or None,
+                "unit_id": cycle.unit_id,
+                "needed_action": entry["needed_action"],
+                "issues": [],
+                "cycle_ids": [],
+            })
+            demand["issues"].extend(
+                issue for issue in entry["issues"] if issue not in demand["issues"]
+            )
+            demand["cycle_ids"].append(cycle.cycle_id)
+    known = {handover.handover_id: handover for handover in material.handovers}
+    for handover in material.handovers:
+        if handover.unit_id not in units or handover.status != "pending":
+            continue
+        demands.setdefault(handover.handover_id, {
+            "handover_id": handover.handover_id,
+            "unit_id": handover.unit_id,
+            "needed_action": "approve_handover",
+            "issues": [],
+            "cycle_ids": [],
+        })
+    items = []
+    for handover_id in sorted(demands):
+        demand = demands[handover_id]
+        handover = known.get(handover_id)
+        if handover is not None and handover.status == "approved" and not demand["issues"]:
+            # 交接已核准且没有遗留问题，不再占用核查队列。
+            continue
+        demand["status"] = handover.status if handover else None
+        demand["delivery_sequence"] = handover.delivery_seq if handover else None
+        items.append(demand)
+    return {
+        "market_id": market_id,
+        "cut": material.cut,
+        "window": material.window.payload(),
+        "total": len(items),
+        "items": items,
+    }
 
 
 def readiness_calendar(db: Connection, trial: Trial, material: Material, market_id: str) -> dict:

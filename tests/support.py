@@ -130,6 +130,43 @@ class ApiCase(unittest.TestCase):
             "delivery_id": delivery_id, "events": events,
         }, status=status)
 
+    def handover(self, handover_id, submission, action, *, status=200, **fields):
+        body = {"handover_id": handover_id, "submission_id": submission, "action": action}
+        body.update(fields)
+        return self.call("POST", ROOT + "/handovers", body, status=status)
+
+    def swap_events(
+        self, unit, cycle="a", *, old_id="main", new_id="spare",
+        start="2026-10-25T09:00:00+00:00",
+        swap_at="2026-10-25T09:05:00+00:00",
+        close="2026-10-25T09:10:00+00:00",
+        old_readings=(20, 120), new_readings=(0, 30),
+    ):
+        return [
+            event(unit, cycle, "start", "start", start),
+            event(unit, cycle, "m0", "meter", start, meter_id=old_id, meter_wh=old_readings[0]),
+            event(unit, cycle, "m1", "meter", swap_at, meter_id=old_id, meter_wh=old_readings[1]),
+            event(unit, cycle, "m2", "meter", swap_at, meter_id=new_id, meter_wh=new_readings[0]),
+            event(unit, cycle, "m3", "meter", close, meter_id=new_id, meter_wh=new_readings[1]),
+            event(unit, cycle, "end", "complete", close),
+        ]
+
+    def handover_body(self, handover_id, unit, swap_at, *, submission=None,
+                      old_id="main", new_id="spare", old_reading=120, new_reading=0, **extra):
+        body = {
+            "handover_id": handover_id,
+            "submission_id": submission or f"sub-{handover_id}",
+            "action": "register",
+            "unit_id": unit,
+            "occurred_at": swap_at,
+            "old_meter_id": old_id,
+            "old_reading_wh": old_reading,
+            "new_meter_id": new_id,
+            "new_reading_wh": new_reading,
+        }
+        body.update(extra)
+        return body
+
     def draft(self, **params):
         return self.call("GET", ROOT + "/preview", params=params)
 

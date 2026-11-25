@@ -12,7 +12,8 @@ from fieldproof.analysis import evidence, reconcile
 from fieldproof.common import encoded, Problem, invalid
 from fieldproof.design.contracts import Key, Input
 from fieldproof.design.registry import get_trial, roster
-from fieldproof.signals import ledger
+from fieldproof.signals import handovers, ledger
+from fieldproof.signals.contracts import HandoverSubmission
 from fieldproof.signals.sheets import parse_sheet
 from fieldproof.storage import Store
 
@@ -34,6 +35,19 @@ def import_sheet(db, arguments):
     with handle as source:
         delivery = parse_sheet(source, select.delivery_id, assigned)
     return encoded(ledger.append(db, trial, assigned, delivery))
+
+
+def submit_handover(db, arguments):
+    import json
+
+    trial = get_trial(db, arguments.trial)
+    assigned = roster(db, trial.trial_id)
+    handle = nullcontext(sys.stdin) if arguments.document == "-" else Path(arguments.document).open(
+        "r", encoding="utf-8"
+    )
+    with handle as source:
+        submission = HandoverSubmission.model_validate(json.load(source))
+    return encoded(handovers.submit(db, trial, assigned, submission))
 
 
 def preview(db, arguments):
@@ -65,6 +79,11 @@ def make_parser():
     ingest.add_argument("trial", help="Trial identifier")
     ingest.add_argument("delivery", help="Stable delivery identifier for retries")
     ingest.add_argument("sheet", help="UTF-8 CSV file, or - for standard input")
+    handover = commands.add_parser(
+        "submit-handover", help="Register, correct, approve or withdraw a meter handover"
+    )
+    handover.add_argument("trial", help="Trial identifier")
+    handover.add_argument("document", help="Handover submission JSON file, or - for standard input")
     draft = commands.add_parser("preview", help="Inspect an as-of comparison")
     draft.add_argument("trial")
     draft.add_argument("--start", type=iso_date)
@@ -79,10 +98,16 @@ def make_parser():
 
 def main(argv=None):
     args = make_parser().parse_args(argv)
-    actions = {"ingest-sheet": import_sheet, "preview": preview, "export": export}
+    actions = {
+        "ingest-sheet": import_sheet,
+        "submit-handover": submit_handover,
+        "preview": preview,
+        "export": export,
+    }
+    write_commands = {"ingest-sheet", "submit-handover"}
     try:
         store = Store(args.db)
-        with store.transaction(write=args.command == "ingest-sheet") as db:
+        with store.transaction(write=args.command in write_commands) as db:
             output = actions[args.command](db, args)
     except Problem as exc:
         print(encoded(exc.payload()), file=sys.stderr)

@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from fieldproof.analysis import evidence, influence, reconcile, sensitivity
-from fieldproof.analysis.checks import inspection_queue, readiness_calendar
+from fieldproof.analysis.checks import handover_worklist, inspection_queue, readiness_calendar
 from fieldproof.analysis.contrast import estimate
 from fieldproof.common import Problem, conflict, missing
 from fieldproof.design import registry
@@ -25,8 +25,8 @@ from fieldproof.design.contracts import (
 )
 from fieldproof.release import bulletins
 from fieldproof.release.contracts import Cut, EvidenceId, FreezeEvidence, IssueBulletin, Review
-from fieldproof.signals import ledger
-from fieldproof.signals.contracts import Delivery
+from fieldproof.signals import handovers, ledger
+from fieldproof.signals.contracts import Delivery, HandoverSubmission
 from fieldproof.storage import Store
 
 QueryCut = Annotated[int, Query(ge=0, le=2**63 - 1)]
@@ -142,6 +142,35 @@ def create_app(database: str | Path) -> FastAPI:
             assigned = registry.roster(db, trial_id)
             return ledger.append(db, trial, assigned, body)
 
+    @app.post("/trials/{trial_id}/handovers")
+    def submit_handover(trial_id: Key, body: HandoverSubmission):
+        with store.transaction(write=True) as db:
+            trial = registry.get_trial(db, trial_id)
+            assigned = registry.roster(db, trial_id)
+            return handovers.submit(db, trial, assigned, body)
+
+    @app.get("/trials/{trial_id}/handovers")
+    def list_handovers(trial_id: Key, unit: Key | None = None, status: str | None = None):
+        with store.transaction() as db:
+            registry.get_trial(db, trial_id)
+            items = handovers.current_all(db, trial_id)
+            if unit is not None:
+                items = [item for item in items if item.unit_id == unit]
+            if status is not None:
+                if status not in ("pending", "approved", "withdrawn"):
+                    raise missing("handover_status", status)
+                items = [item for item in items if item.status == status]
+            return {"items": [item.payload() for item in items]}
+
+    @app.get("/trials/{trial_id}/handovers/{handover_id}")
+    def read_handover(trial_id: Key, handover_id: Key):
+        with store.transaction() as db:
+            registry.get_trial(db, trial_id)
+            return {
+                "current": handovers.require_handover(db, trial_id, handover_id).payload(),
+                "revisions": handovers.history(db, trial_id, handover_id),
+            }
+
     @app.get("/trials/{trial_id}/events/{event_id}")
     def event_history(trial_id: Key, event_id: Key):
         with store.transaction() as db:
@@ -190,6 +219,13 @@ def create_app(database: str | Path) -> FastAPI:
             trial = registry.get_trial(db, trial_id)
             material = evidence.load(db, trial, pick.window(trial), pick.cut)
             return inspection_queue(trial, material, market, site, offset, limit)
+
+    @app.get("/trials/{trial_id}/markets/{market}/handover-worklist")
+    def handover_queue(trial_id: Key, market: Key, pick: Selected):
+        with store.transaction() as db:
+            trial = registry.get_trial(db, trial_id)
+            material = evidence.load(db, trial, pick.window(trial), pick.cut)
+            return handover_worklist(trial, material, market)
 
     @app.get("/trials/{trial_id}/markets/{market}/coverage-calendar")
     def calendar(trial_id: Key, market: Key, pick: Selected):
